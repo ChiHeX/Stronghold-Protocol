@@ -187,6 +187,17 @@
 @keyframes radar-sweep { to { transform: rotate(360deg); } }
 .seat__wait { font-size: calc(.2 * var(--t)); color: var(--text-lo); letter-spacing: .08em; }
 .seat--empty .seat__foot { border-top-style: dashed; }
+.seat--empty .seat__foot { flex-direction: column; gap: .04rem; }
+.seat--empty .seat__foot .btn { min-height: .36rem; }
+
+.invite-picker__backdrop { position: fixed; inset: 0; z-index: var(--z-modal); display: grid; place-items: center; padding: .4rem; background: rgba(0, 0, 0, .72); }
+.invite-picker { width: min(5.8rem, 94vw); max-height: min(6.8rem, 86vh); display: flex; flex-direction: column; padding: .24rem; background: rgba(14, 19, 17, .98); border: 1px solid var(--line-2); box-shadow: 0 .3rem 1rem rgba(0, 0, 0, .6); }
+.invite-picker > header { display: flex; justify-content: space-between; align-items: center; padding-bottom: .16rem; border-bottom: 1px solid var(--line); }
+.invite-picker h2 { margin: .04rem 0 0; font-size: calc(.28 * var(--t)); }
+.invite-picker__list { overflow: auto; display: flex; flex-direction: column; gap: .08rem; padding-top: .12rem; }
+.invite-picker__player { display: flex; align-items: center; justify-content: space-between; gap: .12rem; padding: .08rem; background: rgba(255,255,255,.025); border: 1px solid var(--line); }
+.invite-picker__player > span { display: flex; align-items: center; gap: .1rem; min-width: 0; }
+.invite-picker__player b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .solo-brief {
   --bk-c: var(--mint-500);

@@ -24,7 +24,7 @@ import { SettingsButton } from '../ui/settings.js';
 import { LoadoutButton } from './loadout.js';
 import { net } from '../net.js';
 import { store, useStore, shallowEqual, emptyMatch, isSpectating } from '../store.js';
-import { difficultyInfo } from './lobby.js';
+import { difficultyInfo, formatMatchDuration } from './lobby.js';
 import { t, tc } from '../../../shared/i18n.js';
 
 /**
@@ -99,10 +99,11 @@ export function inviteLink(code) {
  */
 export { copyText };
 
-function SeatCard({ seat, index, room, facts, myId, busy, onAddBot, onRemoveBot, onKick }) {
+function SeatCard({ seat, index, room, facts, myId, busy, onAddBot, onOpenInvite, onRemoveBot, onKick }) {
   const coop = room.mode !== 'solo';
   if (!seat) {
     const canAdd = coop && facts.isHost;
+    const canInvite = canAdd && index === facts.seats.findIndex((s) => !s);
     return html`<article class="seat seat--empty" style=${`--seat-i:${index}`}>
       <header class="seat__head"><span class="seat__no num">P${index + 1}</span><${MicroLabel}>SEAT ${String(index + 1).padStart(2, '0')}<//></header>
       <div class="seat__art seat__art--empty">
@@ -112,7 +113,8 @@ function SeatCard({ seat, index, room, facts, myId, busy, onAddBot, onRemoveBot,
       </div>
       <footer class="seat__foot">
         ${canAdd
-          ? html`<${Button} variant="secondary" size="sm" icon="robot" block=${true} loading=${busy === `add`} onClick=${onAddBot}>${t('添加 AI 队友')}<//>`
+          ? html`${canInvite ? html`<${Button} variant="ghost" size="sm" icon="users" block=${true} onClick=${onOpenInvite}>${t('邀请玩家')}<//>` : null}
+            <${Button} variant="secondary" size="sm" icon="robot" block=${true} loading=${busy === `add`} onClick=${onAddBot}>${t('添加 AI 队友')}<//>`
           : html`<span class="seat__state t-dim">${t('空位')}</span>`}
       </footer>
     </article>`;
@@ -224,10 +226,19 @@ export function RoomScreen() {
   const room = useStore((s) => s.room);
   const me = useStore((s) => s.me, shallowEqual);
   const conn = useStore((s) => s.connection, shallowEqual);
+  const matchmaking = useStore((s) => s.ui.matchmaking, shallowEqual);
+  const invitePlayers = useStore((s) => s.ui.invitePlayers, shallowEqual);
+  const [invitePicker, setInvitePicker] = useState(false);
+  const [elapsedTick, setElapsedTick] = useState(Date.now());
   const [busy, setBusy] = useState(null);
   const alive = useRef(true);
   const inFlight = useRef(false); // synchronous guard against double clicks (state updates are async)
   useEffect(() => () => { alive.current = false; }, []);
+  useEffect(() => {
+    if (!matchmaking) return undefined;
+    const id = setInterval(() => setElapsedTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [!!matchmaking]);
 
   if (!room) return null;
   const online = conn.status === 'online';
@@ -249,7 +260,20 @@ export function RoomScreen() {
 
   const toggleReady = () => run('ready', () => net.request('room.ready', { ready: !myReady }));
   const start = () => run('start', () => net.request('room.start', {}));
+  const matchmake = () => run('match', () => net.request('match.join', {}));
+  const cancelMatch = () => run('cancel-match', () => net.request('match.cancel', {}));
   const addBot = () => run('add', () => net.request('room.addBot', {}));
+  const openInvitePicker = () => run('invite-list', async () => {
+    store.patch('ui', { invitePlayers: null });
+    await net.request('room.inviteList', {});
+    setInvitePicker(true);
+  });
+  const sendInvite = (player) => run(`invite-${player.playerId}`, async () => {
+    await net.request('room.invite', { playerId: player.playerId });
+    toast(t('已向 {name} 发送邀请', { name: player.name }), 'success');
+    setInvitePicker(false);
+    store.patch('ui', { invitePlayers: null });
+  });
   const removeBot = (seat) => run(`rm${seat}`, () => net.request('room.removeBot', { seat }));
   // the host removes a human before the match (community report #17): asked first; the player may join again. The
   // confirmed player's id goes along: if they left and someone else took the seat meanwhile, the server refuses it.
@@ -284,7 +308,9 @@ export function RoomScreen() {
     }
   };
 
-  const statusLine = !online
+  const statusLine = matchmaking
+    ? html`<span class="t-mint">${t('正在寻找队友：{players}/{needed}', { players: matchmaking.players, needed: matchmaking.needed })} · ${t('匹配用时：{time}', { time: formatMatchDuration((matchmaking.elapsedMs || 0) + elapsedTick - (matchmaking.receivedAt || elapsedTick)) })}</span>`
+    : !online
     ? html`<span class="t-orange"><${Icon} name="wifiOff" />${t('连接中断，正在重连…')}</span>`
     : facts.spectating
       ? html`<span class="t-lo"><${Icon} name="eye" />${t('观战中 · 不占博士席位，模拟开始后可切换观看各位博士')}</span>`
@@ -323,7 +349,7 @@ export function RoomScreen() {
 
     <main class=${`seats${coop ? '' : ' seats--solo'}`}>
       ${facts.seats.map((s, i) => html`<${SeatCard} key=${s ? `p${s.playerId}` : `e${i}`} seat=${s} index=${i} room=${room} facts=${facts}
-        myId=${me.playerId} busy=${busy} onAddBot=${addBot} onRemoveBot=${removeBot} onKick=${kick} />`)}
+        myId=${me.playerId} busy=${busy} onAddBot=${addBot} onOpenInvite=${openInvitePicker} onRemoveBot=${removeBot} onKick=${kick} />`)}
       ${coop ? null : html`<aside class="solo-brief brackets">
         <${MicroLabel} tone="mint">BRIEFING<//>
         <h2>${DIFFICULTY_NAMES[room.difficulty] ? t(DIFFICULTY_NAMES[room.difficulty]) : ''}<span class="num t-dim"> ${info.code}</span></h2>
@@ -336,6 +362,16 @@ export function RoomScreen() {
       </aside>`}
     </main>
     <${SpectatorBar} facts=${facts} myId=${me.playerId} busy=${busy} onRemove=${removeSpectator} onSit=${sit} />
+    ${invitePicker ? html`<div class="invite-picker__backdrop" onClick=${(e) => { if (e.target === e.currentTarget) { setInvitePicker(false); store.patch('ui', { invitePlayers: null }); } }}>
+      <section class="invite-picker brackets" role="dialog" aria-modal="true" aria-label=${t('邀请玩家')}>
+        <header><div><${MicroLabel} tone="mint">ONLINE DOCTORS<//><h2>${t('邀请在线玩家')}</h2></div><${Button} variant="ghost" square=${true} icon="close" onClick=${() => { setInvitePicker(false); store.patch('ui', { invitePlayers: null }); }} aria-label=${t('关闭')} /></header>
+        <div class="invite-picker__list">
+          ${invitePlayers === null ? html`<span class="t-lo">${t('正在获取在线玩家…')}</span>`
+            : invitePlayers.length ? invitePlayers.map((player) => html`<div class="invite-picker__player" key=${player.playerId}><span><${AvatarFrame} size="sm" name=${player.name} /><b>${player.name}</b></span><${Button} variant="primary" size="sm" icon="users" loading=${busy === `invite-${player.playerId}`} onClick=${() => sendInvite(player)}>${t('发送邀请')}<//></div>`)
+              : html`<span class="t-lo">${t('当前没有可邀请的在线玩家')}</span>`}
+        </div>
+      </section>
+    </div>` : null}
 
     <footer class="room-bar">
       <div class="room-bar__left">
@@ -358,7 +394,8 @@ export function RoomScreen() {
       <div class="room-bar__right">
         <${LoadoutButton} from="room" size="lg" class="room-loadout" label=${t('干员调配')} />
         ${facts.isHost
-          ? html`<${Tooltip} text=${facts.canStart ? null : t('仍有博士未准备就绪')}>
+          ? html`${coop ? html`<${Button} variant="secondary" size="xl" icon="users" loading=${busy === 'match' || busy === 'cancel-match'} disabled=${!online || !!busy} onClick=${matchmaking ? cancelMatch : matchmake}>${matchmaking ? t('取消匹配') : t('匹配队友')}<//>` : null}
+            <${Tooltip} text=${facts.canStart ? null : t('仍有博士未准备就绪')}>
               <${Button} variant="primary" size="xl" icon="play" loading=${busy === 'start'} disabled=${!facts.canStart || !online} onClick=${start}>${t('开始模拟')}<//>
             <//>`
           : facts.spectating

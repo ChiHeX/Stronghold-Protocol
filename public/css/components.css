@@ -1090,3 +1090,10 @@
   --bk-c: var(--red-premium);
 }
 .crash__box h2 { font-size: calc(.3 * var(--t)); }
+.invite-inbox { position: fixed; top: .18rem; right: .18rem; z-index: calc(var(--z-toast) - 1); width: min(3.8rem, calc(100vw - .36rem)); display: flex; flex-direction: column; gap: .1rem; pointer-events: none; }
+.invite-inbox__card { padding: .16rem; background: rgba(13, 19, 17, .98); border: 1px solid var(--mint-700); box-shadow: 0 .2rem .7rem rgba(0,0,0,.55); pointer-events: auto; }
+.invite-inbox__card > header { display: flex; justify-content: space-between; align-items: center; gap: .1rem; font-size: calc(.17 * var(--t)); }
+.invite-inbox__card p { margin: .1rem 0; font-size: calc(.16 * var(--t)); }
+.invite-inbox__meta, .invite-inbox__actions { display: flex; align-items: center; justify-content: space-between; gap: .06rem; }
+.invite-inbox__meta { margin-bottom: .1rem; color: var(--text-lo); font-size: calc(.14 * var(--t)); }
+.invite-inbox__actions .btn { flex: 1; }

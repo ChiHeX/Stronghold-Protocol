@@ -83,7 +83,8 @@ export const initialState = Object.freeze({
   ticker: [],
   emotes: [],
   clock: { offset: 0, rtt: null, synced: false },
-  ui: { pendingJoin: null, restoring: false, buildStale: false },
+  server: { online: null },
+  ui: { pendingJoin: null, restoring: false, buildStale: false, matchmaking: null, invitePlayers: null, invitations: [] },
 });
 
 /** The app-wide store singleton. */

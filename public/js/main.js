@@ -36,6 +36,7 @@ import { useErrorBoundary } from '../vendor/hooks.module.js';
 import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/components.js';
 import { ConnectionBanner } from './ui/connBanner.js';
 import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
+import { InviteInbox } from './ui/inviteInbox.js';
 import { net, identity, NetError } from './net.js';
 import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
 import { data } from './data.js';
@@ -222,6 +223,23 @@ function wireNet() {
   net.on('replaced', () => toast(t('该身份已在其他页面登录，本页已断开'), 'warn', { ttl: 6000 }));
   net.on('unhandledError', (err) => toastError(err));
   net.on('room.state', onRoomState);
+  net.on('server.presence', (msg) => {
+    if (Number.isInteger(msg.online) && msg.online >= 0) store.patch('server', { online: msg.online });
+  });
+  net.on('room.invite.list', (msg) => store.patch('ui', { invitePlayers: Array.isArray(msg.players) ? msg.players : [] }));
+  net.on('room.invite.received', (msg) => {
+    const current = store.get().ui.invitations || [];
+    if (!current.some((invite) => invite.inviteId === msg.inviteId)) store.patch('ui', { invitations: [...current, payload(msg)] });
+  });
+  net.on('room.invite.result', (msg) => {
+    const text = msg.result === 'accepted' ? '{name}已接受你的同盟邀请' : msg.result === 'declined' ? '{name}拒绝了你的同盟邀请' : '{name}目前无法加入你的同盟';
+    toast(t(text, { name: msg.name || t('博士') }), msg.result === 'accepted' ? 'success' : 'info');
+  });
+  net.on('match.queue', (msg) => {
+    store.patch('ui', { matchmaking: msg.queued ? { ...payload(msg), receivedAt: Date.now() } : null });
+    if (msg.found) toast(t('已匹配到队友，正在进入同盟房间'), 'success');
+    else if (msg.error) toast(t('匹配失败，请重试'), 'warn');
+  });
   net.on('room.closed', (msg) => {
     backToLobby();
     const known = Object.hasOwn(CLOSE_REASON, String(msg.reason)) ? CLOSE_REASON[msg.reason] : null;
@@ -304,6 +322,7 @@ function App() {
     <div class="app-bg" aria-hidden="true"></div>
     ${error ? html`<${ScreenCrashed} error=${error} reset=${resetError} />` : html`<${Screen} key=${route} />`}
     <${ConnectionBanner} />
+    <${InviteInbox} />
     <${ToastHost} />
     <${UiHosts} />
     <${GuideHost} />

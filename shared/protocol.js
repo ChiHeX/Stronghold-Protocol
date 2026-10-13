@@ -411,6 +411,12 @@ export const C2S = {
   // room.closed { reason: 'kicked' }). room.leave / g.leave leave a spectator seat like a player seat.
   'room.spectate': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
   'room.removeSpectator': { playerId: isId },
+  'room.inviteList': {},
+  'room.invite': { playerId: isId },
+  'room.inviteRespond': { inviteId: isId, response: (v) => ['accept', 'decline', 'ignore'].includes(v) },
+  // Same-server co-op matchmaking; queues are volatile and keyed by difficulty.
+  'match.join': { difficulty: (v) => DIFFICULTIES.includes(v), $optional: ['difficulty'] },
+  'match.cancel': {},
 
   // match
   'g.infoReady': { setupRevision: (v) => isInt(v, 0, 2 ** 31), $optional: ['setupRevision'] },
@@ -470,7 +476,8 @@ export const C2S = {
 // Server → client message types (documentation + client dispatch table keys).
 export const S2C = [
   'welcome', 'ok', 'error', 'pong',
-  'room.state', 'room.closed',
+  'room.state', 'room.closed', 'match.queue', 'server.presence',
+  'room.invite.list', 'room.invite.received', 'room.invite.result',
   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
   // m.layer { playerId, bondId, add } — own live prep layer gain; ephemeral, never replayed on resync.
   'm.layer',

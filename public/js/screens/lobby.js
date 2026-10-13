@@ -170,6 +170,14 @@ export function rememberRoom(code) {
   savePref('recentRooms', [code, ...recentRooms().filter((c) => c !== code)].slice(0, 4));
 }
 
+export function formatMatchDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const sec = String(total % 60).padStart(2, '0');
+  const min = String(Math.floor(total / 60) % 60).padStart(2, '0');
+  const hour = Math.floor(total / 3600);
+  return hour ? `${String(hour).padStart(2, '0')}:${min}:${sec}` : `${min}:${sec}`;
+}
+
 const FALLBACK_TIPS = [
   N_('联合模拟在选择策略时可以进行一次跳过'),
   N_('调度中心即使冻结，依然可以主动刷新'),
@@ -243,6 +251,8 @@ function DifficultyCard({ roomMode, difficulty, selected, onSelect }) {
 export function LobbyScreen() {
   const me = useStore((s) => s.me, shallowEqual);
   const conn = useStore((s) => s.connection, shallowEqual);
+  const onlineCount = useStore((s) => s.server.online);
+  const matchmaking = useStore((s) => s.ui.matchmaking, shallowEqual);
   useData('config');
   const [roomMode, setRoomMode] = useState(() => (loadPref('lobby.mode', 'coop') === 'solo' ? 'solo' : 'coop'));
   const [difficulty, setDifficulty] = useState(() => {
@@ -251,10 +261,16 @@ export function LobbyScreen() {
   });
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(null);
+  const [elapsedTick, setElapsedTick] = useState(Date.now());
   const [recent] = useState(recentRooms);
   const alive = useRef(true);
   const inFlight = useRef(false); // synchronous guard against double clicks (state updates are async)
   useEffect(() => () => { alive.current = false; }, []);
+  useEffect(() => {
+    if (!matchmaking) return undefined;
+    const id = setInterval(() => setElapsedTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [!!matchmaking]);
 
   const online = conn.status === 'online';
   const codeOk = CODE_RE.test(code);
@@ -273,6 +289,8 @@ export function LobbyScreen() {
     }
   };
   const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty }));
+  const matchmake = () => run('match', () => net.request('match.join', { difficulty }));
+  const cancelMatch = () => run('cancel-match', () => net.request('match.cancel'));
   const join = (c = code) => {
     // `onClick=${join}` hands the click EVENT as the first argument, and a default parameter only applies to
     // `undefined` — codeArg keeps an event target out of the key and falls back to the input field
@@ -341,7 +359,7 @@ export function LobbyScreen() {
           ${MODE_CARDS.map((c) => html`<${ModeCard} key=${c.id} card=${c} selected=${roomMode === c.id} onSelect=${pickMode} />`)}
         </div>
 
-        <div class="section-label"><span class="section-label__idx num">03</span>${t('加入同盟')}<${MicroLabel}>JOIN WITH ALLIANCE KEY<//></div>
+        <div class="section-label"><span class="section-label__idx num">03</span>${t('加入同盟')}<${MicroLabel}>JOIN WITH ALLIANCE KEY<//><span class="server-online num">${t('服务器在线：{count}', { count: onlineCount ?? '—' })}</span></div>
         <${Panel} class="join-panel" tone="amber">
           <div class="join-row">
             <${TextField} size="code" icon="key" value=${code} placeholder=${t('输入同盟密钥 / 粘贴邀请链接')}
@@ -367,16 +385,22 @@ export function LobbyScreen() {
           ${DIFFICULTIES.map((d) => html`<${DifficultyCard} key=${d} roomMode=${roomMode} difficulty=${d} selected=${difficulty === d} onSelect=${pickDifficulty} />`)}
         </div>
         <div class="create-box">
+          <div class="create-box__actions">
           <${Tooltip} block=${true} text=${online ? null : t('正在连接服务器…')}>
-            <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" loading=${busy === 'create'} disabled=${!online} onClick=${create}>
+            <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" loading=${busy === 'create'} disabled=${!online || !!matchmaking} onClick=${create}>
               ${roomMode === 'solo' ? t('开始独立模拟') : t('创建同盟')}
             <//>
           <//>
+          ${roomMode === 'coop' ? html`<${Button} variant="secondary" size="xl" block=${true} icon="users" loading=${busy === 'match' || busy === 'cancel-match'} disabled=${!online || !!busy} onClick=${matchmaking ? cancelMatch : matchmake}>
+            ${matchmaking ? t('取消匹配') : t('匹配队友')}
+          <//>` : null}
+          </div>
           <div class="create-box__hint">
             ${online
               ? html`<span>${roomMode === 'solo' ? t('创建后即可开始模拟') : t('创建后可邀请好友或添加 AI 队友')}</span>`
               : html`<${Spinner} size="sm" label="CONNECTING" />`}
           </div>
+          ${matchmaking ? html`<div class="matchmaking-box__status">${t('正在寻找队友：{players}/{needed}', { players: matchmaking.players, needed: matchmaking.needed })} · ${t('匹配用时：{time}', { time: formatMatchDuration((matchmaking.elapsedMs || 0) + elapsedTick - (matchmaking.receivedAt || elapsedTick)) })}</div>` : null}
         </div>
       </section>
     </div>

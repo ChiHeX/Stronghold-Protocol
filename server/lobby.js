@@ -99,7 +99,7 @@
 //     a player seat (the seat is kept and given back on resume).
 
 import { randomBytes, randomInt } from 'node:crypto';
-import { ERR, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
+import { DIFFICULTIES, ERR, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
 import { checkLoadout, checkLoadoutOps, cultivationCharIds, checkNotOwned, checkDiyPicks } from '../shared/protocol.js';
 import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
@@ -261,6 +261,12 @@ export class Lobby {
     this.opts = { ...LOBBY_DEFAULTS, ...options };
     /** @type {Map<string, Room>} */
     this.rooms = new Map();
+    /** Co-op matchmaking queues keyed by difficulty; sessions remain in the normal lobby until a group forms. */
+    this.matchQueues = new Map();
+    /** Pending room invitations by id; the client handles ignore locally and the server expires stale invitations. */
+    this.roomInvites = new Map();
+    this.presenceTimer = setInterval(() => this.broadcastOnlineCount(), 10_000);
+    this.presenceTimer.unref?.();
     /** @type {Map<string, NodeJS.Timeout>} lobby grace timers by playerId */
     this.graceTimers = new Map();
     /** @type {Map<string, NodeJS.Timeout>} deferred (coalesced) resyncs by playerId */
@@ -286,6 +292,18 @@ export class Lobby {
     return { rooms: this.rooms.size, matches, humans, bots, spectators };
   }
 
+  onlineCount() {
+    let count = 0;
+    for (const session of this.registry.byPlayerId.values()) if (session.connected) count++;
+    return count;
+  }
+
+  broadcastOnlineCount(session = null) {
+    const msg = { t: 'server.presence', online: this.onlineCount() };
+    if (session) { if (session.connected) sendSession(session, msg); return; }
+    for (const current of this.registry.byPlayerId.values()) if (current.connected) sendSession(current, msg);
+  }
+
   // ---------------------------------------------------------------------------------------------------
   // net.js handler interface
   // ---------------------------------------------------------------------------------------------------
@@ -296,6 +314,11 @@ export class Lobby {
    * @param {{ resumed: boolean, repeat: boolean }} info
    */
   onHello(session, { resumed, repeat }) {
+    this.broadcastOnlineCount(session);
+    this.sendPendingRoomInvites(session);
+    if (![...this.matchQueues.values()].some((queue) => queue.some((party) => party.ids.includes(session.playerId)))) {
+      sendSession(session, { t: 'match.queue', queued: false });
+    }
     if (!resumed && !repeat) return;
     const room = this.roomOf(session);
     if (!room) {
@@ -350,6 +373,11 @@ export class Lobby {
       case 'room.diy': return this.diy(session, msg);
       case 'room.spectate': return this.spectate(session, msg);
       case 'room.removeSpectator': return this.removeSpectator(session, msg);
+      case 'room.inviteList': return this.inviteList(session);
+      case 'room.invite': return this.invite(session, msg);
+      case 'room.inviteRespond': return this.inviteRespond(session, msg);
+      case 'match.join': return this.matchJoin(session, msg);
+      case 'match.cancel': return this.matchCancel(session);
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGame(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -359,6 +387,7 @@ export class Lobby {
   /** The session's socket closed. @param {import('./net.js').Session} session */
   onDisconnect(session) {
     this.clearResync(session.playerId); // the next resume resyncs immediately
+    this.removeFromMatchQueue(session);
     const room = this.roomOf(session);
     // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
     session.resumeWindowMs = room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
@@ -369,6 +398,132 @@ export class Lobby {
     // a spectator's seat is kept like a player's (nothing to tell the match: it plays no field)
     if (room.match) { if (player) this.callMatch(room, 'onDisconnect', session.playerId); } else this.startGrace(room, seat);
     this.broadcastState(room);
+  }
+
+  /** Add a connected lobby session to the co-op queue; a full group becomes a normal co-op room. */
+  matchJoin(session, { difficulty }) {
+    if (!session.connected) return fail(ERR.BAD_MSG, 'connection is closed');
+    const room = this.roomOf(session);
+    let party;
+    if (room) {
+      if (room.mode !== 'coop' || room.match || room.hostId !== session.playerId || room.spectatorOf(session.playerId)) {
+        return fail(ERR.BAD_TARGET, 'only the co-op room host can queue the team');
+      }
+      if (room.matchmaking) return fail(ERR.ALREADY, 'team is already queued');
+      difficulty = room.difficulty;
+      party = { ids: room.activeHumans().filter((s) => s.connected).map((s) => s.playerId), roomCode: room.code, queuedAt: this.now() };
+      if (!party.ids.includes(session.playerId)) return fail(ERR.BAD_TARGET);
+      // AI seats are room conveniences, not matchmaking participants.
+      for (let i = 0; i < room.seats.length; i++) if (room.seats[i]?.isBot) room.seats[i] = null;
+      for (let i = 0; i < room.seats.length; i++) {
+        const seat = room.seats[i];
+        if (seat && !seat.isBot && !seat.connected) {
+          const disconnected = this.registry.byId(seat.playerId);
+          if (disconnected) disconnected.roomCode = null;
+          room.seats[i] = null;
+        }
+      }
+      room.matchmaking = true;
+      this.broadcastState(room);
+    } else {
+      if (!DIFFICULTIES.includes(difficulty)) return fail(ERR.BAD_MSG, 'difficulty is required');
+      party = { ids: [session.playerId], roomCode: null, queuedAt: this.now() };
+    }
+    this.removeFromMatchQueue(session);
+    let queue = this.matchQueues.get(difficulty);
+    if (!queue) this.matchQueues.set(difficulty, queue = []);
+    queue.push(party);
+    this.sendQueueState(difficulty);
+    this.matchQueuedParties(difficulty);
+    return OK;
+  }
+
+  matchCancel(session) {
+    this.removeFromMatchQueue(session);
+    return OK;
+  }
+
+  removeFromMatchQueue(session) {
+    let changed = false;
+    for (const [difficulty, queue] of this.matchQueues) {
+      const removed = queue.filter((party) => party.ids.includes(session.playerId));
+      const next = queue.filter((party) => !party.ids.includes(session.playerId));
+      if (next.length !== queue.length) {
+        changed = true;
+        for (const party of removed) {
+          if (party.roomCode) {
+            const room = this.rooms.get(party.roomCode);
+            if (room) room.matchmaking = false;
+          }
+          for (const id of party.ids) {
+            const member = this.registry.byId(id);
+            if (member?.connected) sendSession(member, { t: 'match.queue', queued: false });
+          }
+        }
+        if (next.length) this.matchQueues.set(difficulty, next); else this.matchQueues.delete(difficulty);
+        this.sendQueueState(difficulty);
+      }
+    }
+    return changed;
+  }
+
+  sendQueueState(difficulty) {
+    const queue = this.matchQueues.get(difficulty) || [];
+    const players = queue.reduce((n, party) => n + party.ids.length, 0);
+    for (const party of queue) for (const id of party.ids) {
+      const session = this.registry.byId(id);
+      if (session?.connected) sendSession(session, { t: 'match.queue', queued: true, difficulty, players, needed: MAX_SEATS, elapsedMs: Math.max(0, this.now() - party.queuedAt) });
+    }
+  }
+
+  /** Match complete parties without splitting an existing room's humans. */
+  matchQueuedParties(difficulty) {
+    const queue = this.matchQueues.get(difficulty);
+    if (!queue) return;
+    while (true) {
+      let chosen = null;
+      const search = (at, count, picked) => {
+        if (count === MAX_SEATS) { chosen = picked; return true; }
+        for (let i = at; i < queue.length; i++) {
+          const party = queue[i];
+          const live = party.ids.filter((id) => this.registry.byId(id)?.connected);
+          if (live.length !== party.ids.length || count + party.ids.length > MAX_SEATS) continue;
+          if (search(i + 1, count + party.ids.length, [...picked, party])) return true;
+        }
+        return false;
+      };
+      if (!search(0, 0, [])) break;
+      const parties = chosen;
+      const ids = parties.flatMap((p) => p.ids);
+      for (const p of parties) queue.splice(queue.indexOf(p), 1);
+      const first = parties[0];
+      let room = first.roomCode ? this.rooms.get(first.roomCode) : null;
+      const host = room ? this.registry.byId(room.hostId) : this.registry.byId(ids[0]);
+      if (!room) {
+        const made = this.create(host, { mode: 'coop', difficulty });
+        if (made?.error) {
+          for (const p of parties) for (const id of p.ids) {
+            const member = this.registry.byId(id);
+            if (member?.connected) sendSession(member, { t: 'match.queue', queued: false, error: made.error });
+          }
+          this.sendQueueState(difficulty);
+          continue;
+        }
+        room = this.roomOf(host);
+      }
+      room.matchmaking = false;
+      for (const id of ids) {
+        const member = this.registry.byId(id);
+        if (member && this.roomOf(member) !== room) this.join(member, { code: room.code });
+      }
+      this.broadcastState(room);
+      for (const id of ids) {
+        const member = this.registry.byId(id);
+        if (member?.connected) sendSession(member, { t: 'match.queue', queued: false, found: true, code: room.code });
+      }
+      this.sendQueueState(difficulty);
+    }
+    if (!queue.length) this.matchQueues.delete(difficulty);
   }
 
   /** The session's reconnect window elapsed (already removed from the registry). */
@@ -387,6 +542,7 @@ export class Lobby {
    * @param {string} [reason]
    */
   shutdown(reason = 'shutdown') {
+    clearInterval(this.presenceTimer);
     for (const room of [...this.rooms.values()]) this.disposeRoom(room, reason);
     for (const t of this.graceTimers.values()) clearTimeout(t);
     this.graceTimers.clear();
@@ -413,6 +569,7 @@ export class Lobby {
     }
     const code = this.genCode();
     if (!code) return fail(ERR.INTERNAL, 'no room code available');
+    this.removeFromMatchQueue(session);
     if (cur) this.removeMember(cur, session.playerId);
     const room = new Room(code, mode, difficulty, this.now());
     room.ownerKey = key;
@@ -439,6 +596,7 @@ export class Lobby {
     if (room.mode === 'solo') return fail(ERR.ROOM_FULL, 'solo room');
     const idx = room.freeSeat();
     if (idx < 0) return fail(ERR.ROOM_FULL);
+    this.removeFromMatchQueue(session);
     if (cur) this.removeMember(cur, session.playerId);
     room.seats[idx] = this.humanSeat(idx, session);
     session.roomCode = room.code;
@@ -452,6 +610,7 @@ export class Lobby {
   leave(session) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
+    this.removeFromMatchQueue(session);
     this.removeMember(room, session.playerId);
     return OK;
   }
@@ -499,6 +658,73 @@ export class Lobby {
       else { target.notice = 'kicked'; target.pendingResult = replay; }
     }
     return OK;
+  }
+
+  inviteList(session) {
+    const room = this.roomOf(session);
+    if (!room || room.mode !== 'coop' || room.hostId !== session.playerId || room.match || room.matchmaking) {
+      return fail(ERR.BAD_TARGET, 'room invitations are available to the co-op host before matchmaking starts');
+    }
+    const seated = new Set(room.activeHumans().map((s) => s.playerId));
+    const players = [];
+    for (const candidate of this.registry.byPlayerId.values()) {
+      if (!candidate.connected || candidate.playerId === session.playerId || seated.has(candidate.playerId)) continue;
+      const current = this.roomOf(candidate);
+      if (current?.match) continue;
+      players.push({ playerId: candidate.playerId, name: candidate.name });
+      if (players.length >= 200) break;
+    }
+    players.sort((a, b) => a.name.localeCompare(b.name));
+    sendSession(session, { t: 'room.invite.list', players });
+    return OK;
+  }
+
+  invite(session, { playerId }) {
+    const room = this.roomOf(session);
+    if (!room || room.mode !== 'coop' || room.hostId !== session.playerId || room.match || room.matchmaking) {
+      return fail(ERR.BAD_TARGET, 'room invitations are available to the co-op host before matchmaking starts');
+    }
+    const target = this.registry.byId(playerId);
+    const current = target && this.roomOf(target);
+    if (!target?.connected || current?.match || room.seatOf(playerId) || room.spectatorOf(playerId)) return fail(ERR.BAD_TARGET, 'player is unavailable');
+    const inviteId = randomBytes(12).toString('hex');
+    const invitation = {
+      inviteId, senderId: session.playerId, recipientId: playerId, roomCode: room.code,
+      fromName: session.name, difficulty: room.difficulty, humans: room.activeHumans().length,
+      expiresAt: this.now() + 120_000,
+    };
+    this.roomInvites.set(inviteId, invitation);
+    sendSession(target, this.roomInviteView(invitation));
+    return OK;
+  }
+
+  inviteRespond(session, { inviteId, response }) {
+    const invitation = this.roomInvites.get(inviteId);
+    if (!invitation || invitation.recipientId !== session.playerId) return fail(ERR.BAD_TARGET, 'invitation expired');
+    this.roomInvites.delete(inviteId);
+    const sender = this.registry.byId(invitation.senderId);
+    if (response === 'ignore') return OK;
+    const room = this.rooms.get(invitation.roomCode);
+    let result = response === 'decline' ? 'declined' : 'unavailable';
+    if (response === 'accept' && room && !room.match && room.mode === 'coop' && session.connected && !this.roomOf(session)?.match) {
+      const joined = this.join(session, { code: room.code });
+      if (!joined.error) result = 'accepted';
+    }
+    if (sender?.connected) sendSession(sender, { t: 'room.invite.result', inviteId, playerId: session.playerId, name: session.name, result });
+    return OK;
+  }
+
+  sendPendingRoomInvites(session) {
+    const now = this.now();
+    for (const [id, invitation] of this.roomInvites) {
+      if (invitation.expiresAt <= now) { this.roomInvites.delete(id); continue; }
+      if (invitation.recipientId === session.playerId && session.connected) sendSession(session, this.roomInviteView(invitation));
+    }
+  }
+
+  roomInviteView(invitation) {
+    const { inviteId, fromName, difficulty, humans, expiresAt } = invitation;
+    return { t: 'room.invite.received', inviteId, fromName, difficulty, humans, expiresAt };
   }
 
   ready(session, { ready }) {
@@ -605,6 +831,7 @@ export class Lobby {
     if (!room) return fail(ERR.NOT_IN_ROOM);
     if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
     if (room.match) return fail(ERR.ROOM_STARTED);
+    if (room.matchmaking) return fail(ERR.ALREADY, 'team is queued for matchmaking');
     const humans = room.activeHumans();
     for (const s of humans) {
       if (s.playerId !== room.hostId && (!s.connected || !s.ready)) return fail(ERR.NOT_READY);

@@ -236,5 +236,9 @@
 
 /* ---- create ------------------------------------------------------------------------------------------ */
 .create-box { margin-top: .3rem; display: flex; flex-direction: column; gap: .12rem; }
+.create-box__actions { display: flex; gap: .12rem; }
+.create-box__actions > * { flex: 1 1 0; min-width: 0; }
+.create-box__actions .btn { width: 100%; }
+.server-online { margin-left: auto; color: var(--text-lo); font-size: calc(.14 * var(--t)); white-space: nowrap; }
 .create-box .btn--xl { height: .92rem; font-size: calc(.32 * var(--t)); letter-spacing: .3em; }
 .create-box__hint { display: flex; align-items: center; justify-content: center; min-height: .3rem; font-size: calc(.14 * var(--t)); color: var(--text-lo); }
